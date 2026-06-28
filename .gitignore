@@ -4,3 +4,6 @@ target/
 *.secret
 agentmsg.db*
 .env
+
+# Local, secret-bearing onboarding docs — never commit
+*.local.md
