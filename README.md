@@ -1,5 +1,9 @@
 # agent-mqtt-chat (`agentmsg`)
 
+[![CI](https://github.com/Barks944/agent-mqtt-chat/actions/workflows/ci.yml/badge.svg)](https://github.com/Barks944/agent-mqtt-chat/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Barks944/agent-mqtt-chat)](https://github.com/Barks944/agent-mqtt-chat/releases)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
+
 Cross-host **agent-to-agent messaging** over MQTT with **post-quantum
 signatures**. A single Rust binary runs as a resident daemon that holds a
 persistent TLS MQTT connection and a durable local store, plus a short-lived
@@ -99,4 +103,13 @@ payload encryption, a typed task/result schema, age-based retention pruning.
 
 ## License
 
-MIT OR Apache-2.0.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
