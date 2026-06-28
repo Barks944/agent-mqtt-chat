@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# Mosquitto configuration for the agentmsg PUBLIC broker.
+#
+# This broker is intentionally a "dumb pipe + access gate": it authenticates
+# connections with a single shared username/password over TLS and then relays
+# messages without inspecting or authorising them per-topic.
+#
+# There is deliberately NO acl_file. All real authority comes from the
+# per-message post-quantum signatures carried in the payloads, which every
+# agentmsg client verifies independently. The broker cannot grant or deny
+# access to topics in any security-meaningful way, so ACLs would add operational
+# complexity without adding trust.
+# ---------------------------------------------------------------------------
+
+# TLS-only listener. Plain (unencrypted) MQTT on 1883 is NOT enabled.
+listener 8883
+
+# TLS material. Provision these out of band (e.g. Let's Encrypt) and place them
+# under /etc/mosquitto/certs/ (see deploy/README.md).
+cafile /etc/mosquitto/certs/ca.crt        # CA chain presented to clients
+certfile /etc/mosquitto/certs/server.crt  # this broker's TLS certificate
+keyfile /etc/mosquitto/certs/server.key   # matching private key (keep secret)
+
+# Reject unauthenticated clients: every connection must present credentials.
+allow_anonymous false
+
+# Single shared credential store (username/password). There is exactly one
+# shared credential for the whole deployment; see the provisioning block below.
+password_file /etc/mosquitto/passwd
+
+# ---------------------------------------------------------------------------
+# Manual provisioning (run on the broker host, as an admin step)
+#
+#   # Create the password file and add the single shared username.
+#   # You will be prompted for the password interactively.
+#   mosquitto_passwd -c /etc/mosquitto/passwd <shared-username>
+#
+#   # To add/update further entries later, omit -c (which would overwrite):
+#   #   mosquitto_passwd /etc/mosquitto/passwd <shared-username>
+#
+#   # Reload the password file (and config) without dropping connections by
+#   # sending SIGHUP to the running broker:
+#   kill -HUP "$(pidof mosquitto)"
+# ---------------------------------------------------------------------------

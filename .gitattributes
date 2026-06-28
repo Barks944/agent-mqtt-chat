@@ -1,0 +1,3 @@
+*.req merge=req-merge
+project.req -text eol=lf
+*.req -text eol=lf

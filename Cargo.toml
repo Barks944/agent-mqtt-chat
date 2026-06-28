@@ -1,0 +1,52 @@
+[package]
+name = "agentmsg"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Cross-host agent-to-agent messaging: a Rust daemon + CLI over MQTT with post-quantum signatures and a trust store"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Barks944/agent-mqtt-chat"
+readme = "README.md"
+keywords = ["mqtt", "agents", "messaging", "post-quantum", "cli"]
+categories = ["command-line-utilities", "cryptography"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+base64 = "0.22"
+ulid = "1"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+directories = "5"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+getrandom = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+
+# Crypto (post-quantum signatures, FIPS 204 ML-DSA-65)
+ml-dsa = { version = "0.1.1", features = ["rand_core", "getrandom"] }
+
+# Transport / storage / ipc
+rumqttc = "0.25"
+rusqlite = { version = "0.32", features = ["bundled"] }
+interprocess = "2.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+# cargo-binstall metadata (asset naming matches taiki-e/upload-rust-binary-action defaults)
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
