@@ -1,0 +1,34 @@
+<!--
+  WinSW (Windows Service Wrapper) configuration for the agentmsg daemon.
+
+  WinSW wraps a console program as a Windows service. To use:
+    1. Download WinSW.exe (https://github.com/winsw/winsw/releases) and place it
+       next to this file, renamed to agentmsg-service.exe so WinSW finds the
+       matching agentmsg-service.xml (rename this file to match).
+    2. Edit the <executable>, <env>, and <workingdirectory> placeholders below.
+    3. Install and start:  agentmsg-service.exe install
+                           agentmsg-service.exe start
+    See deploy/windows/install-service.ps1 for an automated installer plus
+    nssm / sc.exe / schtasks alternatives.
+-->
+<service>
+  <id>agentmsg</id>
+  <name>agentmsg daemon</name>
+  <description>Cross-host agent messaging over MQTT (agentmsg daemon run).</description>
+
+  <!-- EDIT: absolute path to the installed agentmsg.exe -->
+  <executable>C:\Program Files\agentmsg\agentmsg.exe</executable>
+  <arguments>daemon run</arguments>
+
+  <!-- REQUIRED: one data directory per agent. Run one service instance per agent
+       (distinct <id> and AGENTMSG_HOME) to host multiple agents on one machine. -->
+  <env name="AGENTMSG_HOME" value="C:\ProgramData\agentmsg" />
+  <workingdirectory>C:\ProgramData\agentmsg</workingdirectory>
+
+  <!-- The daemon writes tracing to %AGENTMSG_HOME%\daemon.log; WinSW also
+       captures stdout/stderr into rotating logs alongside this file. -->
+  <logmode>roll-by-size</logmode>
+  <onfailure action="restart" delay="5 sec" />
+
+  <startmode>Automatic</startmode>
+</service>

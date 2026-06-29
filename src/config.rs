@@ -66,6 +66,27 @@ pub struct Config {
     /// signed presence heartbeat). 0 disables.
     #[serde(default)]
     pub heartbeat_secs: u64,
+    /// Accept unsigned (alg=none) inbound messages (REQ: unsigned/insecure mode).
+    #[serde(default)]
+    pub allow_unsigned: bool,
+    /// Accept v1 protocol messages for backward compatibility (REQ: protocol
+    /// v2 + compat).
+    #[serde(default = "default_accept_v1")]
+    pub accept_v1: bool,
+    /// Require payload encryption on inbound/outbound messages (REQ: ML-KEM
+    /// payload encryption).
+    #[serde(default)]
+    pub require_encryption: bool,
+    /// Emit automatic delivery/read receipts (REQ: delivery/read receipts).
+    #[serde(default = "default_auto_receipts")]
+    pub auto_receipts: bool,
+}
+
+fn default_accept_v1() -> bool {
+    true
+}
+fn default_auto_receipts() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -82,6 +103,10 @@ impl Default for Config {
             max_bytes: default_max_bytes(),
             max_payload: default_max_payload(),
             heartbeat_secs: 0,
+            allow_unsigned: false,
+            accept_v1: default_accept_v1(),
+            require_encryption: false,
+            auto_receipts: default_auto_receipts(),
         }
     }
 }
