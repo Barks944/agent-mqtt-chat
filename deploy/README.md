@@ -61,3 +61,63 @@ After editing the password file, reload without dropping connections:
 ```sh
 kill -HUP "$(pidof mosquitto)"   # or: docker kill -s HUP agentmsg-broker
 ```
+
+---
+
+# Running the agentmsg daemon on boot
+
+These files keep an agent's daemon (`agentmsg daemon run`) alive across reboots.
+`daemon run` runs in the **foreground**, which is exactly what a service manager
+expects to supervise.
+
+## Per-agent isolation is REQUIRED
+
+Every agentmsg agent — its identity, trust store, message DB, IPC endpoint, lock
+file, and daemon — is derived from a single data directory (`AGENTMSG_HOME`). To
+run **multiple agents on one host you MUST give each its own `AGENTMSG_HOME`** and
+its own service instance. Two agents sharing a home collide on identity, store,
+and the single-daemon lock. With `AGENTMSG_HOME` unset, agentmsg falls back to the
+per-user platform data directory (one agent per OS user).
+
+## Files
+
+- `systemd/agentmsg.service` — Linux systemd unit. Runs `agentmsg daemon run`
+  under a fixed `AGENTMSG_HOME`. Edit the `User`, `Environment=AGENTMSG_HOME`,
+  and `ExecStart` placeholders.
+- `windows/agentmsg.winsw.xml` — Windows service definition for
+  [WinSW](https://github.com/winsw/winsw). Sets `AGENTMSG_HOME` per service.
+- `windows/install-service.ps1` — installs the Windows service (WinSW preferred;
+  nssm / `sc.exe` / `schtasks` alternatives documented inline).
+
+## Linux (systemd)
+
+```sh
+sudo install -m 0644 systemd/agentmsg.service /etc/systemd/system/agentmsg.service
+sudoedit /etc/systemd/system/agentmsg.service     # set User, AGENTMSG_HOME, ExecStart
+sudo systemctl daemon-reload
+sudo systemctl enable --now agentmsg
+journalctl -u agentmsg -f                          # follow logs
+```
+
+For several agents on one host, copy the unit per agent (e.g.
+`agentmsg-alice.service`, `agentmsg-bob.service`) each with a distinct
+`AGENTMSG_HOME`, and `enable --now` each.
+
+## Windows
+
+Run an elevated PowerShell prompt:
+
+```powershell
+# WinSW (preferred — supports per-service AGENTMSG_HOME):
+.\windows\install-service.ps1 `
+    -ExePath 'C:\Program Files\agentmsg\agentmsg.exe' `
+    -AgentHome 'C:\ProgramData\agentmsg' `
+    -WinswPath '.\WinSW.exe'
+
+# Or fall back to sc.exe (one machine-level AGENTMSG_HOME only):
+.\windows\install-service.ps1 -AgentHome 'C:\ProgramData\agentmsg'
+```
+
+The script also documents `nssm` (best for multiple agents) and a `schtasks`
+run-at-startup variant. The daemon writes tracing to `%AGENTMSG_HOME%\daemon.log`
+(`$AGENTMSG_HOME/daemon.log` on Linux).

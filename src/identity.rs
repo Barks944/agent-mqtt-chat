@@ -1,15 +1,18 @@
-//! Local agent identity: the ML-DSA-65 keypair this daemon signs with.
+//! Local agent identity: the ML-DSA-65 signing keypair this daemon signs with,
+//! plus an ML-KEM-768 keypair for receiving encrypted payloads.
 //!
 //! REQ-0007: generate + export identity. REQ-0022: one identity per daemon.
 //! REQ-0027: private key stored owner-only. REQ-0028: never export private key.
+//! REQ: ML-KEM payload encryption (recipient KEM keypair).
 
 use ml_dsa::{Generate, Keypair, MlDsa65, Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::kem;
 use crate::paths;
 use crate::token::IdentityToken;
-use crate::wire::{b64, make_kid, unb64};
+use crate::wire::{b64, fingerprint, make_kid, unb64};
 
 /// 32-byte seed length used to persist the signing key.
 const SEED_LEN: usize = 32;
@@ -19,6 +22,10 @@ struct IdentityFile {
     name: String,
     /// base64url of the 32-byte signing-key seed (PRIVATE).
     seed: String,
+    /// base64url of the encoded ML-KEM-768 decapsulation key (PRIVATE).
+    /// Optional so pre-v2 identity files still load; backfilled on next save.
+    #[serde(default)]
+    kem_seed: Option<String>,
 }
 
 /// A loaded local identity.
@@ -27,23 +34,45 @@ pub struct Identity {
     signing_key: SigningKey<MlDsa65>,
     /// Encoded public key (1952 bytes).
     public_key: Vec<u8>,
+    /// Encoded ML-KEM-768 decapsulation key (PRIVATE).
+    kem_dk: Vec<u8>,
+    /// Encoded ML-KEM-768 encapsulation key (public).
+    kem_ek: Vec<u8>,
 }
 
 impl Identity {
-    /// Generate a fresh identity for `name` using the OS RNG.
+    /// Generate a fresh identity for `name` using the OS RNG (both keypairs).
     pub fn generate(name: impl Into<String>) -> Identity {
         let signing_key = SigningKey::<MlDsa65>::generate();
         let public_key = signing_key.verifying_key().encode().to_vec();
+        let (kem_dk, kem_ek) = kem::generate();
         Identity {
             name: name.into(),
             signing_key,
             public_key,
+            kem_dk,
+            kem_ek,
         }
     }
 
-    /// The encoded public key bytes.
+    /// The encoded ML-DSA-65 public key bytes.
     pub fn public_key(&self) -> &[u8] {
         &self.public_key
+    }
+
+    /// The encoded ML-KEM-768 encapsulation (public) key bytes.
+    pub fn kem_ek(&self) -> &[u8] {
+        &self.kem_ek
+    }
+
+    /// The encoded ML-KEM-768 decapsulation (private) key bytes.
+    pub fn kem_dk(&self) -> &[u8] {
+        &self.kem_dk
+    }
+
+    /// Fingerprint of the KEM encapsulation key (matches `recipient_kid`).
+    pub fn kem_fingerprint(&self) -> String {
+        kem::kem_fingerprint(&self.kem_ek)
     }
 
     /// Signer key id `<name>#<fingerprint>` for the wrapper.
@@ -51,9 +80,13 @@ impl Identity {
         make_kid(&self.name, &self.public_key)
     }
 
-    /// Shareable public identity token (REQ-0007/0043).
+    /// Shareable public identity token (REQ-0007/0043), carrying both keys.
     pub fn token(&self) -> IdentityToken {
-        IdentityToken::new(self.name.clone(), self.public_key.clone())
+        IdentityToken::with_kem(
+            self.name.clone(),
+            self.public_key.clone(),
+            Some(self.kem_ek.clone()),
+        )
     }
 
     /// Sign a message, returning the encoded signature bytes (REQ-0005).
@@ -75,6 +108,7 @@ impl Identity {
         let file = IdentityFile {
             name: self.name.clone(),
             seed: b64(seed.as_slice()),
+            kem_seed: Some(b64(&self.kem_dk)),
         };
         let text = serde_json::to_string_pretty(&file)?;
         std::fs::write(&path, text)?;
@@ -98,12 +132,68 @@ impl Identity {
             .map_err(|_| Error::Crypto("seed must be 32 bytes".into()))?;
         let signing_key = SigningKey::<MlDsa65>::from_seed(&seed.into());
         let public_key = signing_key.verifying_key().encode().to_vec();
+        // Restore the KEM keypair, or backfill a fresh one for pre-v2 files
+        // (persisted on the next `save()`).
+        let (kem_dk, kem_ek) = match file.kem_seed.as_deref() {
+            Some(stored) => {
+                let kem_dk = unb64(stored).map_err(|_| Error::Crypto("bad kem seed".into()))?;
+                let kem_ek = kem::ek_from_seed(&kem_dk);
+                (kem_dk, kem_ek)
+            }
+            None => kem::generate(),
+        };
         Ok(Identity {
             name: file.name,
             signing_key,
             public_key,
+            kem_dk,
+            kem_ek,
         })
     }
+
+    /// Back up an existing identity file to `identity.json.bak-<fp>` (owner-only)
+    /// before it is overwritten. Returns the backed-up identity's fingerprint, or
+    /// `None` if there was nothing to back up.
+    pub fn backup_existing() -> Result<Option<String>> {
+        let path = paths::identity_path()?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let fp = load_name_fp()?
+            .map(|(_, fp)| fp)
+            .unwrap_or_else(|| "unknown".to_string());
+        let bak = paths::data_dir()?.join(format!("identity.json.bak-{fp}"));
+        std::fs::copy(&path, &bak)?;
+        restrict_permissions(&bak)?;
+        Ok(Some(fp))
+    }
+}
+
+/// Read the existing identity's `(name, fingerprint)` without a hard failure on
+/// a malformed file (returns `None` when absent/unreadable). Used by the
+/// `id generate` cross-name guard and by [`Identity::backup_existing`].
+pub fn load_name_fp() -> Result<Option<(String, String)>> {
+    let path = paths::identity_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    let file: IdentityFile = match serde_json::from_str(&text) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let Ok(seed_bytes) = unb64(&file.seed) else {
+        return Ok(None);
+    };
+    let Ok(seed) = <[u8; SEED_LEN]>::try_from(seed_bytes.as_slice()) else {
+        return Ok(None);
+    };
+    let signing_key = SigningKey::<MlDsa65>::from_seed(&seed.into());
+    let public_key = signing_key.verifying_key().encode().to_vec();
+    Ok(Some((file.name, fingerprint(&public_key))))
 }
 
 #[cfg(unix)]
@@ -142,5 +232,52 @@ mod tests {
     fn public_key_len_is_ml_dsa_65() {
         let id = Identity::generate("bob");
         assert_eq!(id.public_key().len(), crypto::PUBLIC_KEY_LEN);
+    }
+
+    /// Serializes the `AGENTMSG_HOME`-mutating tests so they cannot race on the
+    /// process-global environment variable.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn load_name_fp_backs_the_generate_guard() {
+        // The `id generate` cross-name guard refuses to overwrite an existing
+        // identity with a different name; it reads the current (name, fp) via
+        // `load_name_fp`. Here we verify that data source end-to-end on disk.
+        let _g = HOME_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTMSG_HOME", dir.path());
+
+        // Nothing on disk yet -> no existing identity to guard against.
+        assert!(load_name_fp().unwrap().is_none());
+
+        let id = Identity::generate("orchestrator");
+        id.save().unwrap();
+
+        let (name, fp) = load_name_fp().unwrap().expect("identity present");
+        assert_eq!(name, "orchestrator");
+        assert_eq!(fp, fingerprint(id.public_key()));
+        // The guard compares the requested name against this one: a mismatch
+        // (e.g. requesting "worker") is what triggers the refuse-without-force.
+        assert_ne!(name, "worker");
+
+        std::env::remove_var("AGENTMSG_HOME");
+    }
+
+    #[test]
+    fn backup_existing_copies_identity_file() {
+        let _g = HOME_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTMSG_HOME", dir.path());
+
+        // Nothing to back up initially.
+        assert!(Identity::backup_existing().unwrap().is_none());
+
+        let id = Identity::generate("agent-a");
+        id.save().unwrap();
+        let fp = Identity::backup_existing().unwrap().expect("backed up");
+        assert_eq!(fp, fingerprint(id.public_key()));
+        assert!(dir.path().join(format!("identity.json.bak-{fp}")).exists());
+
+        std::env::remove_var("AGENTMSG_HOME");
     }
 }

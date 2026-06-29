@@ -58,3 +58,9 @@ pub fn ipc_name() -> Result<String> {
 pub fn lock_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("daemon.lock"))
 }
+
+/// Daemon log file (the background daemon writes tracing output here so
+/// `daemon start --wait` can tail it on a readiness timeout).
+pub fn log_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("daemon.log"))
+}

@@ -84,6 +84,84 @@ cargo install --git https://github.com/Barks944/agent-mqtt-chat agentmsg
 
 Every subcommand supports `--json` for scripting by agents.
 
+## Running multiple agents on one host
+
+Every agentmsg agent (identity + trust store + message DB + daemon) lives under a
+single data directory. The daemon, identity, trust store, SQLite store, IPC
+endpoint, and lock file are all derived from it. To run **more than one agent on
+the same host you MUST give each one a distinct data directory** via the
+`AGENTMSG_HOME` environment variable — this is required, not optional. Two agents
+sharing a home would collide on identity, store, and the single-daemon lock.
+
+```sh
+# agent "alice"
+export AGENTMSG_HOME=/var/lib/agentmsg/alice
+agentmsg id generate alice
+agentmsg daemon start
+
+# agent "bob" — separate shell / separate environment
+export AGENTMSG_HOME=/var/lib/agentmsg/bob
+agentmsg id generate bob
+agentmsg daemon start
+```
+
+If `AGENTMSG_HOME` is unset, agentmsg uses the per-user platform data directory
+(so one agent per OS user works with no configuration).
+
+## Multiple channels (topics)
+
+A daemon subscribes to **all** configured topics and publishes to the first
+(primary) by default. Configure additional channels with `config add-topic`, then
+target a specific channel per message with `send --topic`:
+
+```sh
+agentmsg config set-topic agentmsg/chat        # primary
+agentmsg config add-topic agentmsg/ops         # extra channel
+agentmsg send "deploying now" --to bob --topic agentmsg/ops
+```
+
+`--topic` must be one of the configured topics; otherwise the send is rejected.
+
+## Reading: one `--consumer` per reader
+
+`read` drains a durable queue using a named cursor (`--consumer`, default
+`default`). **Each independent reader must use its own distinct `--consumer`
+name.** This is a footgun: two readers sharing a consumer name share one cursor,
+so each delivered message is seen by only one of them and the other silently
+misses it. Use a stable, unique name per reader (e.g. the tool or session name);
+`read` warns on stderr when a consumer falls far behind. Use `browse` for a
+non-destructive view that does not advance any cursor.
+
+## v2 features
+
+agentmsg v0.2 keeps full backward compatibility with v1 signed messages and adds:
+
+- **Unsigned / insecure mode** — opt-in `send --unsigned` plus
+  `config set-security --allow-unsigned` for trust-minimised or bootstrap setups.
+  A known signing agent is never allowed to silently downgrade to unsigned
+  (rejected as `downgrade_rejected`).
+- **Typed message kinds** — `send --kind <message|command|query|result|ack|error|grant|receipt>`
+  with `--correlation-id` and `--supersedes` for structured request/response flows.
+- **Human-authorization grants** — a separate `authority` key signs capability
+  `grant` tokens (`authority generate`, `grant --to … --action … --scope … --expiry …`).
+  A message can carry a grant (`send --grant <token|@file>`); receivers verify it
+  against trusted authorities, enforce expiry, subject match, and single-use replay.
+- **End-to-end encryption** — `send --encrypt` seals the payload with ML-KEM-768
+  key encapsulation + AES-256-GCM to the recipient's KEM key. (Encryption to the
+  broadcast address `*` is unsupported.)
+- **Delivery & read receipts** — direct messages get automatic `delivered`
+  receipts (and `read` receipts on `read --ack`); inspect outbound delivery state
+  with `receipts`. Toggle with `config set-security --auto-receipts`.
+- **Application presence** — `presence set <state>` / `presence list` publish and
+  surface agent online/offline state with a TTL, alongside the daemon heartbeat.
+- **Follow mode** — `read --follow` streams new messages live over the IPC channel
+  after draining the queue.
+- **Diagnostics** — `rejections` (why messages were refused, with the claimed
+  sender), `consumers` (per-cursor backlog), `log` (chronological transcript),
+  and `reply <msg-id> <body>` (correlated response to a stored message).
+- **Token integrity** — v2 identity tokens carry a CRC checksum and a public-key
+  length guard, so a truncated or corrupted paste is rejected rather than stored.
+
 ## Security model
 
 | Layer | Provides |
@@ -91,15 +169,27 @@ Every subcommand supports `--json` for scripting by agents.
 | TLS to broker | wire confidentiality |
 | Shared broker credential | keeps the public off the broker |
 | **ML-DSA-65 signature + trust store** | **authenticity — the real authority** |
+| ML-KEM-768 + AES-256-GCM (`--encrypt`) | end-to-end payload confidentiality |
+| Authority-signed grants | human authorization of capabilities |
 | Nonce + timestamp + id dedupe | replay protection |
 
 The broker is never a trust anchor; authority is end-to-end between agents.
 
+## Run on boot
+
+To keep an agent's daemon running across reboots, see
+[`deploy/README.md`](deploy/README.md) for a Linux **systemd** unit
+(`deploy/systemd/agentmsg.service`) and a Windows service via **WinSW**
+(`deploy/windows/`), both of which run `agentmsg daemon run` in the foreground
+under a fixed `AGENTMSG_HOME`.
+
 ## Status
 
 Verified working: two agents exchanging post-quantum-signed messages
-bidirectionally through a live Mosquitto broker. Deferred (optional): ML-KEM
-payload encryption, a typed task/result schema, age-based retention pruning.
+bidirectionally through a live Mosquitto broker. v0.2 adds ML-KEM payload
+encryption, typed message kinds, authority-signed grants, delivery/read
+receipts, application presence, and follow-mode streaming (see
+[v2 features](#v2-features)).
 
 ## License
 

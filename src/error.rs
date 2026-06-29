@@ -48,6 +48,26 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Serde(String),
 
+    #[error("identity name mismatch: {0}")]
+    // exit 4
+    IdentityNameMismatch(String),
+
+    #[error("no authority key configured; run `agentmsg authority generate` first")]
+    // exit 4
+    NoAuthority,
+
+    #[error("token corrupt: {0}")]
+    // exit 5  (checksum/length failure)
+    TokenCorrupt(String),
+
+    #[error("key rotation required: {0}")]
+    // exit 5
+    RotationRequired(String),
+
+    #[error("not an authority token")]
+    // exit 5
+    NotAnAuthorityToken,
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -75,6 +95,28 @@ pub enum RejectReason {
     Stale,
     #[error("payload too large")]
     TooLarge,
+    #[error("unsigned messages are not allowed")]
+    UnsignedNotAllowed,
+    #[error("protocol downgrade rejected for a known signing agent")]
+    DowngradeRejected,
+    #[error("unknown authority")]
+    UnknownAuthority,
+    #[error("invalid grant")]
+    InvalidGrant,
+    #[error("grant expired")]
+    GrantExpired,
+    #[error("grant subject does not match sender")]
+    GrantSubjectMismatch,
+    #[error("decryption failed")]
+    DecryptFailed,
+    #[error("unknown recipient key")]
+    UnknownRecipientKey,
+    #[error("encrypted broadcast is not supported")]
+    EncBroadcastUnsupported,
+    #[error("replayed grant")]
+    ReplayedGrant,
+    #[error("pairing hello self-signature is invalid")]
+    PairSelfSigInvalid,
 }
 
 impl RejectReason {
@@ -90,6 +132,35 @@ impl RejectReason {
             RejectReason::Duplicate => "duplicate",
             RejectReason::Stale => "stale",
             RejectReason::TooLarge => "too_large",
+            RejectReason::UnsignedNotAllowed => "unsigned_not_allowed",
+            RejectReason::DowngradeRejected => "downgrade_rejected",
+            RejectReason::UnknownAuthority => "unknown_authority",
+            RejectReason::InvalidGrant => "invalid_grant",
+            RejectReason::GrantExpired => "grant_expired",
+            RejectReason::GrantSubjectMismatch => "grant_subject_mismatch",
+            RejectReason::DecryptFailed => "decrypt_failed",
+            RejectReason::UnknownRecipientKey => "unknown_recipient_key",
+            RejectReason::EncBroadcastUnsupported => "enc_broadcast_unsupported",
+            RejectReason::ReplayedGrant => "replayed_grant",
+            RejectReason::PairSelfSigInvalid => "pair_self_sig_invalid",
+        }
+    }
+}
+
+/// Rejection metadata recorded alongside the reason (REQ-0046). The claimed
+/// sender (from the wrapper `kid`) is captured when known so diagnostics can
+/// attribute a rejection even when verification failed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RejectInfo {
+    pub reason: RejectReason,
+    pub claimed_sender: Option<String>,
+}
+
+impl From<RejectReason> for RejectInfo {
+    fn from(reason: RejectReason) -> Self {
+        RejectInfo {
+            reason,
+            claimed_sender: None,
         }
     }
 }

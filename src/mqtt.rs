@@ -35,6 +35,21 @@ impl Mqtt {
 
         let mut opts = MqttOptions::new(client_id, &cfg.broker_host, cfg.broker_port);
         opts.set_keep_alive(Duration::from_secs(20));
+        // rumqttc defaults the max incoming/outgoing packet size to 10 KiB, which
+        // is SMALLER than a post-quantum envelope: a single ML-DSA-65 signature is
+        // 3309 bytes and a TOFU pairing hello embeds the full ML-DSA-65 (1952 B)
+        // and ML-KEM-768 (1184 B) public keys, pushing the wrapper past 10 KiB.
+        // Without raising this cap rumqttc refuses to (de)serialise such packets,
+        // poll() returns an error, the connection drops, and the queued publish is
+        // retried on every reconnect — an endless reconnect storm. Size the limit
+        // from the configured payload cap plus envelope overhead (double base64 of
+        // the body inside the inner, the signature, and JSON framing).
+        let max_pkt = cfg
+            .max_payload
+            .saturating_mul(2)
+            .saturating_add(64 * 1024)
+            .max(256 * 1024);
+        opts.set_max_packet_size(max_pkt, max_pkt);
         opts.set_clean_session(false); // persistent session (REQ-0033)
         if !cfg.username.is_empty() {
             opts.set_credentials(&cfg.username, &cfg.password);
@@ -69,7 +84,8 @@ impl Mqtt {
                         on_message(p.topic.clone(), p.payload.to_vec());
                     }
                     Ok(_) => {}
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::warn!("eventloop poll error: {e}");
                         conn_flag.store(false, Ordering::Relaxed);
                         if stop_flag.load(Ordering::Relaxed) {
                             break;

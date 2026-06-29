@@ -1,0 +1,41 @@
+[Unit]
+Description=agentmsg daemon (cross-host agent messaging over MQTT)
+Documentation=https://github.com/Barks944/agent-mqtt-chat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- EDIT THESE PLACEHOLDERS ---------------------------------------------
+# Run the daemon under a dedicated unprivileged user.
+User=agentmsg
+Group=agentmsg
+
+# REQUIRED: one data directory per agent. Each agent (identity + trust store +
+# message DB + daemon) must have its own AGENTMSG_HOME. To run several agents on
+# one host, install one copy of this unit per agent (e.g. agentmsg@alice.service)
+# each with a distinct AGENTMSG_HOME.
+Environment=AGENTMSG_HOME=/var/lib/agentmsg
+
+# Absolute path to the installed binary and the foreground run command.
+ExecStart=/usr/local/bin/agentmsg daemon run
+# -------------------------------------------------------------------------
+
+# The daemon logs tracing output to $AGENTMSG_HOME/daemon.log; journald also
+# captures stdout/stderr below.
+StandardOutput=journal
+StandardError=journal
+
+Restart=on-failure
+RestartSec=5s
+
+# Hardening (relax if your AGENTMSG_HOME lives elsewhere).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/agentmsg
+
+[Install]
+WantedBy=multi-user.target

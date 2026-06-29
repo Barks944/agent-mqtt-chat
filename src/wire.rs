@@ -16,14 +16,39 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, RejectReason, Result};
 
 /// Wire protocol version (REQ-0025).
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 /// Signature algorithm identifier (REQ-0026).
 pub const ALG_ML_DSA_65: &str = "ML-DSA-65";
+/// Algorithm identifier for an unsigned (insecure) message.
+pub const ALG_NONE: &str = "none";
+/// Algorithm identifier for ML-KEM-768 + AES-256-GCM payload encryption.
+pub const ALG_KEM_AEAD: &str = "ML-KEM-768.AES-256-GCM";
 /// Recipient marker for broadcast messages (REQ-0031).
 pub const BROADCAST: &str = "*";
 /// Baseline recognised content types (REQ + recognised content types).
 pub const CTYPE_TEXT: &str = "text/plain";
 pub const CTYPE_JSON: &str = "application/json";
+/// Content type for application presence beacons.
+pub const CTYPE_PRESENCE: &str = "application/agentmsg-presence";
+/// Content type for delivery/read receipts.
+pub const CTYPE_RECEIPT: &str = "application/agentmsg-receipt";
+/// Content type for a TOFU/SAS pairing "hello" (REQ: bootstrap/pairing mode).
+pub const CTYPE_PAIR: &str = "application/agentmsg-pair";
+
+/// Typed message kind (REQ: typed schema). Defaults to `Message`.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MsgKind {
+    #[default]
+    Message,
+    Command,
+    Query,
+    Result,
+    Ack,
+    Error,
+    Grant,
+    Receipt,
+}
 
 /// The signed wrapper — this is exactly what is published on the MQTT topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,12 +57,16 @@ pub struct Wrapper {
     pub v: u8,
     /// Signature algorithm.
     pub alg: String,
-    /// Signer key id: "<sender-name>#<public-key-fingerprint>".
-    pub kid: String,
+    /// Signer key id: "<sender-name>#<public-key-fingerprint>". Absent for
+    /// unsigned (alg=none) messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
     /// base64url(no-pad) of the exact inner-message bytes that were signed.
     pub msg: String,
-    /// base64url(no-pad) of the signature over the decoded `msg` bytes.
-    pub sig: String,
+    /// base64url(no-pad) of the signature over the decoded `msg` bytes. Absent
+    /// for unsigned (alg=none) messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 /// The inner message (decoded from `Wrapper::msg`).
@@ -63,6 +92,70 @@ pub struct Inner {
     /// Opaque payload (REQ: body is opaque, identified by ctype). Binary
     /// payloads are carried base64-encoded under an octet-stream ctype.
     pub body: String,
+    /// Typed message kind (REQ: typed schema).
+    #[serde(default)]
+    pub kind: MsgKind,
+    /// Correlation id linking related messages (REQ: typed schema).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Id of a message this one supersedes (REQ: typed schema).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// Payload encryption metadata; present when `body` is ciphertext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enc: Option<EncInfo>,
+    /// A signed human-authorization grant carried with the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<SignedGrant>,
+    /// A delivery/read receipt referencing a prior message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Receipt>,
+}
+
+/// Payload encryption metadata (REQ: ML-KEM payload encryption). When present,
+/// `Inner::body` holds the base64url AES-256-GCM ciphertext.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncInfo {
+    /// AEAD/KEM algorithm identifier ([`ALG_KEM_AEAD`]).
+    pub alg: String,
+    /// base64url ML-KEM-768 ciphertext (encapsulated shared secret).
+    pub kem_ct: String,
+    /// Recipient KEM key fingerprint the ciphertext is bound to.
+    pub recipient_kid: String,
+    /// base64url AES-256-GCM nonce (12 bytes).
+    pub nonce: String,
+    /// Original (plaintext) content type, restored after decryption.
+    pub ptype: String,
+}
+
+/// A human-authorization grant signed by an authority key (REQ: grants).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedGrant {
+    /// Signature algorithm ([`ALG_ML_DSA_65`]).
+    pub alg: String,
+    /// Authority key id: "<authority-name>#<fingerprint>".
+    pub authority_kid: String,
+    /// base64url of the canonical [`crate::grant::GrantClaims`] JSON bytes.
+    pub grant: String,
+    /// base64url signature over the decoded grant bytes.
+    pub sig: String,
+}
+
+/// A delivery/read receipt (REQ: delivery/read receipts).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Receipt {
+    /// Id of the message this receipt refers to.
+    pub ref_id: String,
+    /// Receipt status.
+    pub status: ReceiptStatus,
+}
+
+/// Delivery state advertised by a [`Receipt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptStatus {
+    Delivered,
+    Read,
 }
 
 impl Inner {
@@ -124,10 +217,12 @@ impl Wrapper {
             .map_err(|_| RejectReason::MalformedWrapper)
     }
 
-    /// Decode the signature bytes.
+    /// Decode the signature bytes. Errors if the wrapper carries no signature
+    /// (an unsigned `alg=none` message).
     pub fn sig_bytes(&self) -> std::result::Result<Vec<u8>, RejectReason> {
+        let sig = self.sig.as_deref().ok_or(RejectReason::MalformedWrapper)?;
         URL_SAFE_NO_PAD
-            .decode(self.sig.as_bytes())
+            .decode(sig.as_bytes())
             .map_err(|_| RejectReason::MalformedWrapper)
     }
 
@@ -141,28 +236,39 @@ impl Wrapper {
 mod tests {
     use super::*;
 
-    #[test]
-    fn roundtrip_inner_bytes_are_stable() {
-        // REQ-0055: signing over transmitted bytes — re-decoding `msg` yields
-        // the identical bytes that were base64-encoded.
-        let inner = Inner {
-            id: "01J0".into(),
+    /// Minimal cleartext, signed `Inner` for wire tests (v2 field set).
+    fn test_inner(id: &str, from: &str, to: &str, body: &str) -> Inner {
+        Inner {
+            id: id.into(),
             v: PROTOCOL_VERSION,
-            from: "alice".into(),
-            to: "bob".into(),
+            from: from.into(),
+            to: to.into(),
             ts: "2026-06-28T00:00:00Z".into(),
             nonce: "abc".into(),
             ctype: CTYPE_TEXT.into(),
             in_reply_to: None,
-            body: "hello".into(),
-        };
+            body: body.into(),
+            kind: MsgKind::default(),
+            correlation_id: None,
+            supersedes: None,
+            enc: None,
+            grant: None,
+            receipt: None,
+        }
+    }
+
+    #[test]
+    fn roundtrip_inner_bytes_are_stable() {
+        // REQ-0055: signing over transmitted bytes — re-decoding `msg` yields
+        // the identical bytes that were base64-encoded.
+        let inner = test_inner("01J0", "alice", "bob", "hello");
         let bytes = serde_json::to_vec(&inner).unwrap();
         let w = Wrapper {
             v: PROTOCOL_VERSION,
             alg: ALG_ML_DSA_65.into(),
-            kid: "alice#deadbeef".into(),
+            kid: Some("alice#deadbeef".into()),
             msg: b64(&bytes),
-            sig: b64(b"sig"),
+            sig: Some(b64(b"sig")),
         };
         let wire = w.to_bytes().unwrap();
         let parsed = Wrapper::from_bytes(&wire).unwrap();
@@ -174,18 +280,29 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_addressing() {
-        let inner = Inner {
-            id: "1".into(),
-            v: 1,
-            from: "a".into(),
-            to: BROADCAST.into(),
-            ts: "t".into(),
-            nonce: "n".into(),
-            ctype: CTYPE_TEXT.into(),
-            in_reply_to: None,
-            body: "hi".into(),
+    fn unsigned_wrapper_omits_kid_and_sig() {
+        // alg=none messages carry neither a key id nor a signature.
+        let inner = test_inner("1", "alice", "bob", "hi");
+        let w = Wrapper {
+            v: PROTOCOL_VERSION,
+            alg: ALG_NONE.into(),
+            kid: None,
+            msg: b64(&serde_json::to_vec(&inner).unwrap()),
+            sig: None,
         };
+        let wire = w.to_bytes().unwrap();
+        // Optional fields are skipped when serializing.
+        let text = String::from_utf8(wire.clone()).unwrap();
+        assert!(!text.contains("\"kid\""));
+        assert!(!text.contains("\"sig\""));
+        let parsed = Wrapper::from_bytes(&wire).unwrap();
+        assert!(parsed.kid.is_none());
+        assert!(parsed.sig_bytes().is_err());
+    }
+
+    #[test]
+    fn broadcast_addressing() {
+        let inner = test_inner("1", "a", BROADCAST, "hi");
         assert!(inner.is_broadcast());
         assert!(inner.addressed_to("anyone"));
     }
