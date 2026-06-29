@@ -109,6 +109,15 @@ pub enum Request {
     },
     /// List known presence records (REQ: application presence).
     PresenceList,
+    /// Broadcast a self-signed pairing hello (REQ: bootstrap/pairing mode).
+    PairStart {
+        #[serde(default)]
+        topic: Option<String>,
+    },
+    /// List peers seen on the pairing topic and awaiting confirmation.
+    PairList,
+    /// Confirm a pending peer into the trust store after a SAS match.
+    PairConfirm { name: String },
     /// Connect the broker session (REQ-0018).
     Connect,
     /// Disconnect the broker session (REQ-0018).
@@ -175,9 +184,24 @@ pub enum Response {
     Rejections(Vec<RejectionRow>),
     Consumers(Vec<ConsumerRow>),
     Presence(Vec<PresenceRow>),
+    /// Pending pairings awaiting SAS confirmation (REQ: bootstrap/pairing mode).
+    Pairs(Vec<PendingPairView>),
     Error {
         message: String,
     },
+}
+
+/// A pending pairing as surfaced to the CLI (REQ: bootstrap/pairing mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPairView {
+    /// Advertised peer name.
+    pub name: String,
+    /// Peer signing-key fingerprint.
+    pub fingerprint: String,
+    /// The 6-digit Short Authentication String to compare out-of-band.
+    pub sas: String,
+    /// Whether the peer advertised an ML-KEM encryption key.
+    pub kem: bool,
 }
 
 /// A frame written on a [`Request::Subscribe`] connection (REQ: IPC stream).

@@ -20,7 +20,7 @@ use crate::daemon::Daemon;
 use crate::error::{Error, Result};
 use crate::grant::{self, GrantClaims};
 use crate::identity::{self, Identity};
-use crate::ipc::{self, Request, Response, StreamFrame, IPC_PROTO_VERSION};
+use crate::ipc::{self, PendingPairView, Request, Response, StreamFrame, IPC_PROTO_VERSION};
 use crate::store::{ConsumerRow, PresenceRow, RejectionRow};
 use crate::token::IdentityToken;
 use crate::trust::TrustStore;
@@ -72,6 +72,11 @@ pub enum Command {
     Presence {
         #[command(subcommand)]
         cmd: PresenceCmd,
+    },
+    /// Bootstrap trust with a peer via TOFU + a compared SAS code.
+    Pair {
+        #[command(subcommand)]
+        cmd: PairCmd,
     },
     /// Show daemon + connection status.
     Status,
@@ -348,6 +353,20 @@ pub enum PresenceCmd {
     List,
 }
 
+#[derive(Subcommand)]
+pub enum PairCmd {
+    /// Broadcast this agent's identity to begin pairing on a topic.
+    Start {
+        /// Override the publish topic (must be a configured chat topic).
+        #[arg(long)]
+        topic: Option<String>,
+    },
+    /// List peers seen pairing, with their SAS codes to compare.
+    List,
+    /// Confirm a peer into the trust store after the SAS codes match.
+    Confirm { name: String },
+}
+
 /// JSON envelope for `--json` output.
 #[derive(Serialize)]
 struct JsonOut<T: Serialize> {
@@ -437,6 +456,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Command::Config { cmd } => config_cmd(json, cmd),
         Command::Daemon { cmd } => daemon_cmd(json, cmd),
         Command::Presence { cmd } => presence_cmd(json, cmd),
+        Command::Pair { cmd } => pair_cmd(json, cmd),
         Command::Status => status_cmd(json),
         Command::Send {
             body,
@@ -1166,6 +1186,90 @@ fn presence_cmd(json: bool, cmd: &PresenceCmd) -> Result<()> {
                 other => render_simple(json, other, "presence"),
             }
         }
+    }
+}
+
+// --- pairing --------------------------------------------------------------
+
+fn pair_cmd(json: bool, cmd: &PairCmd) -> Result<()> {
+    match cmd {
+        PairCmd::Start { topic } => {
+            hello()?;
+            let resp = call(Request::PairStart {
+                topic: topic.clone(),
+            })?;
+            match resp {
+                Response::Ok => {
+                    ok_json(json, true, || {
+                        println!("broadcast your identity on the pairing topic.");
+                        println!(
+                            "ask the peer to run `agentmsg pair start` too, then compare the \
+                             6-digit code from `agentmsg pair list` and run \
+                             `agentmsg pair confirm <name>`."
+                        );
+                    });
+                    Ok(())
+                }
+                Response::Error { message } => Err(Error::Ipc(message)),
+                other => render_simple(json, other, "pair start"),
+            }
+        }
+        PairCmd::List => {
+            let resp = call(Request::PairList)?;
+            match resp {
+                Response::Pairs(rows) => {
+                    ok_json(json, &rows, || print_pairs(&rows));
+                    Ok(())
+                }
+                Response::Error { message } => Err(Error::Ipc(message)),
+                other => render_simple(json, other, "pair list"),
+            }
+        }
+        PairCmd::Confirm { name } => {
+            let resp = call(Request::PairConfirm { name: name.clone() })?;
+            match resp {
+                Response::Ok => {
+                    // Surface the resulting trust-store fingerprint for the prompt.
+                    let fp = TrustStore::load()
+                        .ok()
+                        .and_then(|ts| ts.list().into_iter().find(|a| a.name == *name))
+                        .map(|a| a.fingerprint())
+                        .unwrap_or_default();
+                    #[derive(Serialize)]
+                    struct Out {
+                        name: String,
+                        fingerprint: String,
+                    }
+                    let data = Out {
+                        name: name.clone(),
+                        fingerprint: fp.clone(),
+                    };
+                    ok_json(json, data, || {
+                        println!("paired with {name} ({fp}) — added to trust store");
+                    });
+                    Ok(())
+                }
+                Response::Error { message } => Err(Error::Ipc(message)),
+                other => render_simple(json, other, "pair confirm"),
+            }
+        }
+    }
+}
+
+fn print_pairs(rows: &[PendingPairView]) {
+    if rows.is_empty() {
+        println!("(no peers pairing — ask the peer to run `agentmsg pair start`)");
+        return;
+    }
+    for p in rows {
+        let kem = if p.kem { " +kem" } else { "" };
+        println!(
+            "{name}  SAS {sas}  ({fp}{kem})\n    compare the SAS with the peer, then: \
+             agentmsg pair confirm {name}",
+            name = p.name,
+            sas = p.sas,
+            fp = p.fingerprint,
+        );
     }
 }
 

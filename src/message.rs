@@ -20,10 +20,11 @@ use crate::error::{RejectInfo, RejectReason};
 use crate::grant;
 use crate::identity::Identity;
 use crate::kem;
+use crate::pair::{PairBody, PairHello};
 use crate::trust::TrustStore;
 use crate::wire::{
     b64, fingerprint, make_kid, split_kid, unb64, EncInfo, Inner, MsgKind, Receipt, SignedGrant,
-    Wrapper, ALG_KEM_AEAD, ALG_ML_DSA_65, ALG_NONE, BROADCAST, PROTOCOL_VERSION,
+    Wrapper, ALG_KEM_AEAD, ALG_ML_DSA_65, ALG_NONE, BROADCAST, CTYPE_PAIR, PROTOCOL_VERSION,
 };
 
 /// Options describing the message to build (REQ: typed schema, encryption,
@@ -166,6 +167,81 @@ pub fn build(
 /// (REQ: ML-KEM payload encryption). Must match on build and verify.
 fn aad(inner: &Inner) -> String {
     format!("{}|{}|{}|{}", inner.id, inner.from, inner.to, inner.ts)
+}
+
+/// Build a self-signed pairing "hello" broadcast (REQ: bootstrap/pairing mode).
+///
+/// The hello rides the normal [`Wrapper`]/[`Inner`] envelope but advertises the
+/// sender's own keys in a [`crate::wire::CTYPE_PAIR`] JSON body and is signed by
+/// the very key it advertises (proof-of-possession). Because [`build`] signs
+/// with `id`'s key and sets `kid = <name>#<fp(id.public_key)>`, the wrapper is
+/// self-signed by construction; [`verify_pair`] checks it WITHOUT consulting the
+/// trust store.
+pub fn build_pair(id: &Identity) -> std::result::Result<(Inner, Wrapper), RejectReason> {
+    let body = serde_json::to_string(&PairBody {
+        name: id.name.clone(),
+        pk: b64(id.public_key()),
+        kem_pk: Some(b64(id.kem_ek())),
+    })
+    .map_err(|_| RejectReason::MalformedWrapper)?;
+    // Broadcast on the pairing topic; a normal signed build is exactly the
+    // self-signed proof-of-possession we want.
+    build(id, &BuildOpts::new(BROADCAST, CTYPE_PAIR, &body))
+}
+
+/// Verify a self-signed pairing hello (REQ: bootstrap/pairing mode).
+///
+/// Parses the wrapper, decodes the embedded public key from the BODY, verifies
+/// the wrapper signature against THAT key (self-signed proof-of-possession),
+/// confirms the `kid` fingerprint matches the embedded key, and returns the
+/// advertised [`PairHello`]. The trust store is intentionally NOT consulted: a
+/// hello is trustworthy only after an out-of-band SAS comparison.
+pub fn verify_pair(raw: &[u8]) -> std::result::Result<PairHello, RejectReason> {
+    let wrapper = Wrapper::from_bytes(raw)?;
+    if wrapper.alg != ALG_ML_DSA_65 {
+        return Err(RejectReason::PairSelfSigInvalid);
+    }
+    let inner_bytes = wrapper.inner_bytes()?;
+    let inner = Wrapper::parse_inner(&inner_bytes)?;
+    if inner.ctype != CTYPE_PAIR {
+        return Err(RejectReason::MalformedWrapper);
+    }
+
+    // The advertised key comes from the body, not the trust store.
+    let body: PairBody =
+        serde_json::from_str(&inner.body).map_err(|_| RejectReason::MalformedWrapper)?;
+    let public_key = unb64(&body.pk).map_err(|_| RejectReason::MalformedWrapper)?;
+
+    // Self-signed proof-of-possession: the signature must verify under the very
+    // key the body advertises.
+    let sig_bytes = wrapper.sig_bytes()?;
+    if !crypto::verify(&public_key, &inner_bytes, &sig_bytes) {
+        return Err(RejectReason::PairSelfSigInvalid);
+    }
+
+    // The kid fingerprint must commit to the embedded key, and all three names
+    // (kid / inner.from / body.name) must agree.
+    let kid = wrapper
+        .kid
+        .as_deref()
+        .ok_or(RejectReason::MalformedWrapper)?;
+    let (kid_name, kid_fp) = split_kid(kid).ok_or(RejectReason::MalformedWrapper)?;
+    if kid_fp != fingerprint(&public_key) {
+        return Err(RejectReason::PairSelfSigInvalid);
+    }
+    if kid_name != body.name || inner.from != body.name {
+        return Err(RejectReason::MalformedWrapper);
+    }
+
+    let kem_public_key = match body.kem_pk {
+        Some(k) => Some(unb64(&k).map_err(|_| RejectReason::MalformedWrapper)?),
+        None => None,
+    };
+    Ok(PairHello {
+        name: body.name,
+        public_key,
+        kem_public_key,
+    })
 }
 
 /// Verify a wrapper received on the wire. On success returns the decoded (and,
@@ -452,6 +528,72 @@ mod tests {
                 .reason,
             RejectReason::InvalidSignature
         );
+    }
+
+    #[test]
+    fn pair_hello_self_signed_accepts() {
+        // A genuine self-signed hello verifies WITHOUT any trust store and
+        // surfaces the advertised keys (REQ: bootstrap/pairing mode).
+        let alice = Identity::generate("alice");
+        let (_inner, w) = build_pair(&alice).unwrap();
+        let raw = w.to_bytes().unwrap();
+        let hello = verify_pair(&raw).unwrap();
+        assert_eq!(hello.name, "alice");
+        assert_eq!(hello.public_key, alice.public_key());
+        assert_eq!(hello.kem_public_key.as_deref(), Some(alice.kem_ek()));
+    }
+
+    #[test]
+    fn pair_hello_swapped_pk_rejected() {
+        // Swapping the body's advertised pk to a different key breaks the
+        // self-signature (the signature no longer verifies under the body key).
+        let alice = Identity::generate("alice");
+        let mallory = Identity::generate("alice"); // same name, different key
+        let (_inner, w) = build_pair(&alice).unwrap();
+
+        let mut inner = Wrapper::parse_inner(&w.inner_bytes().unwrap()).unwrap();
+        let body = crate::pair::PairBody {
+            name: "alice".into(),
+            pk: b64(mallory.public_key()),
+            kem_pk: Some(b64(mallory.kem_ek())),
+        };
+        inner.body = serde_json::to_string(&body).unwrap();
+        let mut w = w;
+        w.msg = b64(&serde_json::to_vec(&inner).unwrap());
+        let raw = w.to_bytes().unwrap();
+        assert_eq!(
+            verify_pair(&raw).unwrap_err(),
+            RejectReason::PairSelfSigInvalid
+        );
+    }
+
+    #[test]
+    fn pair_confirm_adds_peer_to_trust_store() {
+        // The confirm step captures the verified hello's keys into the trust
+        // store via `add_with_kem` (REQ: bootstrap/pairing mode).
+        use crate::pair::sas;
+        let alice = Identity::generate("alice");
+        let bob = Identity::generate("bob");
+        let (_i, w) = build_pair(&alice).unwrap();
+        let raw = w.to_bytes().unwrap();
+        let hello = verify_pair(&raw).unwrap();
+
+        // Both sides derive the same SAS for the operators to compare.
+        assert_eq!(
+            sas(bob.public_key(), &hello.public_key),
+            sas(&hello.public_key, bob.public_key())
+        );
+
+        let mut ts = TrustStore::default();
+        assert!(!ts.contains("alice"));
+        ts.add_with_kem(
+            &hello.name,
+            &hello.public_key,
+            hello.kem_public_key.as_deref(),
+        );
+        assert!(ts.contains("alice"));
+        assert_eq!(ts.public_key("alice").unwrap(), alice.public_key());
+        assert_eq!(ts.kem_public_key("alice").as_deref(), Some(alice.kem_ek()));
     }
 
     #[test]

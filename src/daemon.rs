@@ -7,6 +7,7 @@
 //! streaming [`Request::Subscribe`] consumers. `send` honours the v2 message
 //! attributes (topic/kind/correlation/supersedes/encrypt/grant/unsigned).
 
+use std::collections::BTreeMap;
 use std::io::{BufReader, ErrorKind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -22,17 +23,35 @@ use crate::config::Config;
 use crate::error::{Error, RejectReason, Result};
 use crate::grant;
 use crate::identity::Identity;
-use crate::ipc::{self, Request, Response, StatusInfo, StreamFrame, IPC_PROTO_VERSION};
+use crate::ipc::{
+    self, PendingPairView, Request, Response, StatusInfo, StreamFrame, IPC_PROTO_VERSION,
+};
 use crate::message::{self, BuildOpts};
 use crate::mqtt::{Mqtt, OnMessage};
+use crate::pair::sas;
 use crate::store::{Outbound, Store, StoredMsg};
 use crate::trust::TrustStore;
 use crate::wire::{
-    fingerprint, split_kid, MsgKind, Receipt, ReceiptStatus, Wrapper, CTYPE_PRESENCE, CTYPE_RECEIPT,
+    fingerprint, split_kid, MsgKind, Receipt, ReceiptStatus, Wrapper, CTYPE_PAIR, CTYPE_PRESENCE,
+    CTYPE_RECEIPT,
 };
 
 /// Registry of live streaming subscribers: (unique id, consumer name, sender).
 type Subscribers = Arc<Mutex<Vec<(u64, String, SyncSender<StreamFrame>)>>>;
+
+/// A peer seen on the pairing topic, awaiting an out-of-band SAS confirmation
+/// before it is added to the trust store (REQ: bootstrap/pairing mode).
+#[derive(Debug, Clone)]
+struct PendingPair {
+    name: String,
+    public_key: Vec<u8>,
+    kem_public_key: Option<Vec<u8>>,
+    sas: String,
+    first_seen: String,
+}
+
+/// In-memory map of pending pairings keyed by peer name.
+type Pending = Arc<Mutex<BTreeMap<String, PendingPair>>>;
 
 /// JSON body of an application presence beacon (REQ: application presence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +76,8 @@ pub struct Daemon {
     subscribers: Subscribers,
     /// Monotonic id source for subscriber registry entries.
     next_sub_id: AtomicU64,
+    /// Peers seen on the pairing topic, awaiting SAS confirmation.
+    pending: Pending,
 }
 
 impl Daemon {
@@ -78,6 +99,7 @@ impl Daemon {
             mqtt: Arc::new(Mutex::new(None)),
             subscribers: Arc::new(Mutex::new(Vec::new())),
             next_sub_id: AtomicU64::new(1),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
         });
 
         // Single-instance guard: binding the endpoint fails if one is running.
@@ -134,6 +156,7 @@ impl Daemon {
         let store = self.store.clone();
         let identity = self.identity.clone();
         let subscribers = self.subscribers.clone();
+        let pending = self.pending.clone();
         let me = self.identity.name.clone();
         let client_id = format!("{}-{}", me, std::process::id());
         let on_msg: OnMessage = Arc::new(move |topic: String, payload: Vec<u8>| {
@@ -141,6 +164,35 @@ impl Daemon {
             if let Ok(w) = Wrapper::from_bytes(&payload) {
                 if let Some((name, _)) = w.kid.as_deref().and_then(split_kid) {
                     if name == me {
+                        return;
+                    }
+                }
+                // Pairing intercept (REQ: bootstrap/pairing mode): a CTYPE_PAIR
+                // hello is self-signed and must NOT go through the trust-store
+                // verify path. Peek the inner ctype, then verify_pair separately.
+                if let Ok(peek) = w.inner_bytes().and_then(|b| Wrapper::parse_inner(&b)) {
+                    if peek.ctype == CTYPE_PAIR {
+                        match message::verify_pair(&payload) {
+                            Ok(hello) => {
+                                let sas_code = sas(identity.public_key(), &hello.public_key);
+                                let entry = PendingPair {
+                                    name: hello.name.clone(),
+                                    public_key: hello.public_key,
+                                    kem_public_key: hello.kem_public_key,
+                                    sas: sas_code,
+                                    first_seen: peek.ts.clone(),
+                                };
+                                pending.lock().unwrap().entry(hello.name).or_insert(entry);
+                            }
+                            Err(reason) => {
+                                let _ = store.record_rejection(
+                                    &reason,
+                                    Some(&peek.from),
+                                    &topic,
+                                    "pairing hello",
+                                );
+                            }
+                        }
                         return;
                     }
                 }
@@ -483,6 +535,9 @@ impl Daemon {
                 Ok(rows) => Response::Presence(rows),
                 Err(e) => err(e),
             },
+            Request::PairStart { topic } => self.pair_start(topic),
+            Request::PairList => self.pair_list(),
+            Request::PairConfirm { name } => self.pair_confirm(name),
             // Subscribe is handled in handle_conn; reaching here is a protocol bug.
             Request::Subscribe { .. } => Response::Error {
                 message: "subscribe must be served as a stream".into(),
@@ -591,6 +646,112 @@ impl Daemon {
             detail,
         };
         enqueue_presence(&self.identity, &self.store, &topic, &beacon);
+        Response::Ok
+    }
+
+    /// Broadcast a self-signed pairing hello on the chosen (or primary) topic
+    /// (REQ: bootstrap/pairing mode). The operator can re-run to re-broadcast.
+    fn pair_start(&self, topic: Option<String>) -> Response {
+        let cfg = Config::load().unwrap_or_default();
+        let topic = match topic {
+            Some(t) => {
+                if !cfg.topics.iter().any(|c| c == &t) {
+                    return Response::Error {
+                        message: format!("topic '{t}' is not a configured chat topic"),
+                    };
+                }
+                t
+            }
+            None => match cfg.primary_topic() {
+                Some(t) => t.to_string(),
+                None => {
+                    return Response::Error {
+                        message: "no chat topic configured".into(),
+                    }
+                }
+            },
+        };
+        let (inner, wrapper) = match message::build_pair(&self.identity) {
+            Ok(v) => v,
+            Err(e) => {
+                return Response::Error {
+                    message: e.to_string(),
+                }
+            }
+        };
+        let payload = match wrapper.to_bytes() {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        if let Err(e) = self.store.enqueue_outbound(&Outbound {
+            id: inner.id,
+            topic: topic.clone(),
+            payload: payload.clone(),
+            qos: 1,
+            retain: false,
+        }) {
+            return err(e);
+        }
+        // Publish immediately when connected (the outbox pump covers the rest).
+        if self.is_connected() {
+            let _ = self
+                .mqtt
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.publish(&topic, payload, false));
+        }
+        Response::Ok
+    }
+
+    /// The peers seen on the pairing topic awaiting confirmation.
+    fn pair_list(&self) -> Response {
+        let views: Vec<PendingPairView> = self
+            .pending
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| PendingPairView {
+                name: p.name.clone(),
+                fingerprint: fingerprint(&p.public_key),
+                sas: p.sas.clone(),
+                kem: p.kem_public_key.is_some(),
+            })
+            .collect();
+        Response::Pairs(views)
+    }
+
+    /// Confirm a pending peer into the trust store after a SAS match, capturing
+    /// both its signing and KEM keys, then drop it from the pending map.
+    fn pair_confirm(&self, name: String) -> Response {
+        let entry = self.pending.lock().unwrap().get(&name).cloned();
+        let entry = match entry {
+            Some(e) => e,
+            None => {
+                return Response::Error {
+                    message: format!("no pending pairing for '{name}'"),
+                }
+            }
+        };
+        let mut ts = match TrustStore::load() {
+            Ok(t) => t,
+            Err(e) => return err(e),
+        };
+        ts.add_with_kem(
+            &entry.name,
+            &entry.public_key,
+            entry.kem_public_key.as_deref(),
+        );
+        if let Err(e) = ts.save() {
+            return err(e);
+        }
+        self.pending.lock().unwrap().remove(&name);
+        tracing::info!(
+            "paired with '{}' ({}) first seen {}",
+            entry.name,
+            fingerprint(&entry.public_key),
+            entry.first_seen
+        );
         Response::Ok
     }
 

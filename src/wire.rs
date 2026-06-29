@@ -32,6 +32,8 @@ pub const CTYPE_JSON: &str = "application/json";
 pub const CTYPE_PRESENCE: &str = "application/agentmsg-presence";
 /// Content type for delivery/read receipts.
 pub const CTYPE_RECEIPT: &str = "application/agentmsg-receipt";
+/// Content type for a TOFU/SAS pairing "hello" (REQ: bootstrap/pairing mode).
+pub const CTYPE_PAIR: &str = "application/agentmsg-pair";
 
 /// Typed message kind (REQ: typed schema). Defaults to `Message`.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]

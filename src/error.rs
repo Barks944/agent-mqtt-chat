@@ -115,6 +115,8 @@ pub enum RejectReason {
     EncBroadcastUnsupported,
     #[error("replayed grant")]
     ReplayedGrant,
+    #[error("pairing hello self-signature is invalid")]
+    PairSelfSigInvalid,
 }
 
 impl RejectReason {
@@ -140,6 +142,7 @@ impl RejectReason {
             RejectReason::UnknownRecipientKey => "unknown_recipient_key",
             RejectReason::EncBroadcastUnsupported => "enc_broadcast_unsupported",
             RejectReason::ReplayedGrant => "replayed_grant",
+            RejectReason::PairSelfSigInvalid => "pair_self_sig_invalid",
         }
     }
 }

@@ -89,6 +89,19 @@ impl TrustStore {
         );
     }
 
+    /// Add or replace by explicit name + signing key + optional KEM key. Used by
+    /// the pairing flow, which captures both keys from a verified hello
+    /// (REQ: bootstrap/pairing mode).
+    pub fn add_with_kem(&mut self, name: &str, public_key: &[u8], kem_public_key: Option<&[u8]>) {
+        self.agents.insert(
+            name.to_string(),
+            KnownAgentRecord {
+                pk: b64(public_key),
+                kem_pk: kem_public_key.map(b64),
+            },
+        );
+    }
+
     /// Remove a known agent; returns true if it existed (REQ-0041).
     pub fn remove(&mut self, name: &str) -> bool {
         self.agents.remove(name).is_some()

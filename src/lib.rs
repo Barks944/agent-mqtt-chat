@@ -15,6 +15,7 @@ pub mod ipc;
 pub mod kem;
 pub mod message;
 pub mod mqtt;
+pub mod pair;
 pub mod paths;
 pub mod store;
 pub mod token;
