@@ -1,6 +1,6 @@
 [package]
 name = "agentmsg"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Cross-host agent-to-agent messaging: a Rust daemon + CLI over MQTT with post-quantum signatures and a trust store"
@@ -31,7 +31,7 @@ hex = "0.4"
 ml-dsa = { version = "0.1.1", features = ["rand_core", "getrandom"] }
 
 # Crypto (post-quantum KEM, FIPS 203 ML-KEM-768 + AES-256-GCM payload encryption)
-ml-kem = "0.2"
+ml-kem = { version = "0.2", features = ["deterministic"] }
 aes-gcm = "0.10"
 # RNG trait glue for ml-kem key generation / encapsulation (matches ml-kem's rand_core 0.6)
 rand_core = "0.6"
