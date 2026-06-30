@@ -8,16 +8,17 @@
 //! bound in as AEAD associated data so a ciphertext cannot be replayed against
 //! a different envelope.
 //!
-//! Persistence note: the `ml-kem` crate's seed-based (deterministic) keygen is
-//! behind a non-default feature, so we persist the *encoded decapsulation key*
-//! instead of a 64-byte seed. [`generate`] therefore returns the encoded dk as
-//! its first element; [`ek_from_seed`] reconstructs the encapsulation key from
-//! that stored dk material.
+//! Key derivation note: the ML-KEM-768 keypair is derived **deterministically
+//! from the agent's 32-byte signing seed** (see [`derive_from_seed`]), exactly
+//! like the ML-DSA signing key. This keeps the advertised KEM public key stable
+//! across every load and process, and gives migrated v0.1 identities (which
+//! persist only the signing seed) a stable KEM key with no new on-disk storage.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{Ciphertext, Encoded, EncodedSizeUser, KemCore, MlKem768};
+use ml_kem::{Ciphertext, Encoded, EncodedSizeUser, KemCore, MlKem768, B32};
+use sha2::{Digest, Sha256};
 
 use crate::wire::fingerprint;
 
@@ -58,25 +59,37 @@ impl rand_core::RngCore for OsRng {
 
 impl rand_core::CryptoRng for OsRng {}
 
-/// Generate a fresh ML-KEM-768 keypair. Returns `(encoded decapsulation key,
-/// encoded encapsulation key)`. The decapsulation key is PRIVATE and is what we
-/// persist (see module note); the encapsulation key is shared publicly.
-pub fn generate() -> (Vec<u8>, Vec<u8>) {
-    let mut rng = OsRng;
-    let (dk, ek) = MlKem768::generate(&mut rng);
+/// Deterministically derive the ML-KEM-768 keypair from a 32-byte identity
+/// `seed`, returning `(encoded decapsulation key, encoded encapsulation key)`.
+///
+/// The two 32-byte inputs ML-KEM keygen requires (`d`, `z`) are taken from
+/// domain-separated SHA-256 of the seed, so the keypair is a pure function of
+/// the seed: every load and every process derives the **same** KEM key (and the
+/// public half advertised in the token always matches the private half the
+/// daemon decrypts with). The decapsulation key is PRIVATE; the encapsulation
+/// key is shared publicly.
+pub fn derive_from_seed(seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let d = B32::from(kdf(b"agentmsg-kem-d-v1", seed));
+    let z = B32::from(kdf(b"agentmsg-kem-z-v1", seed));
+    let (dk, ek) = MlKem768::generate_deterministic(&d, &z);
     (dk.as_bytes().to_vec(), ek.as_bytes().to_vec())
 }
 
-/// Reconstruct the encoded encapsulation (public) key from the stored
-/// decapsulation-key material produced by [`generate`].
-///
-/// (Named `ek_from_seed` to match the design contract; with dk-encoding
-/// persistence the `seed` argument carries the encoded decapsulation key.)
-pub fn ek_from_seed(seed: &[u8]) -> Vec<u8> {
-    match Encoded::<Dk>::try_from(seed) {
+/// Reconstruct the encoded encapsulation (public) key from an encoded
+/// decapsulation key (used to verify a derived keypair is self-consistent).
+pub fn ek_from_dk(dk: &[u8]) -> Vec<u8> {
+    match Encoded::<Dk>::try_from(dk) {
         Ok(enc) => Dk::from_bytes(&enc).encapsulation_key().as_bytes().to_vec(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Domain-separated SHA-256 of `seed` into a 32-byte value.
+fn kdf(domain: &[u8], seed: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(domain);
+    h.update(seed);
+    h.finalize().into()
 }
 
 /// Short fingerprint of an encapsulation key (reuses the wrapper fingerprint so
@@ -131,12 +144,25 @@ mod tests {
 
     #[test]
     fn kem_roundtrip() {
-        let (dk, ek) = generate();
+        let seed = [3u8; 32];
+        let (dk, ek) = derive_from_seed(&seed);
         assert_eq!(ek.len(), KEM_PK_LEN);
-        assert_eq!(ek_from_seed(&dk), ek);
+        assert_eq!(ek_from_dk(&dk), ek);
         let (ct, ss_send) = encapsulate(&ek).unwrap();
         let ss_recv = decapsulate(&dk, &ct).unwrap();
         assert_eq!(ss_send, ss_recv);
+    }
+
+    #[test]
+    fn derivation_is_deterministic() {
+        // The whole fix: the same seed must always yield the same KEM keypair,
+        // and different seeds must differ.
+        let (dk1, ek1) = derive_from_seed(&[9u8; 32]);
+        let (dk2, ek2) = derive_from_seed(&[9u8; 32]);
+        assert_eq!(dk1, dk2);
+        assert_eq!(ek1, ek2);
+        let (_dk3, ek3) = derive_from_seed(&[10u8; 32]);
+        assert_ne!(ek1, ek3);
     }
 
     #[test]

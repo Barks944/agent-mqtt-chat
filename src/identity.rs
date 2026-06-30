@@ -20,12 +20,12 @@ const SEED_LEN: usize = 32;
 #[derive(Serialize, Deserialize)]
 struct IdentityFile {
     name: String,
-    /// base64url of the 32-byte signing-key seed (PRIVATE).
+    /// base64url of the 32-byte signing-key seed (PRIVATE). The ML-KEM-768
+    /// keypair is derived deterministically from this same seed (see
+    /// [`kem::derive_from_seed`]), so nothing else needs to be persisted and a
+    /// migrated v0.1 file (which has only `name` + `seed`) yields a stable KEM
+    /// key. A legacy `kem_seed` field, if present, is ignored.
     seed: String,
-    /// base64url of the encoded ML-KEM-768 decapsulation key (PRIVATE).
-    /// Optional so pre-v2 identity files still load; backfilled on next save.
-    #[serde(default)]
-    kem_seed: Option<String>,
 }
 
 /// A loaded local identity.
@@ -45,7 +45,9 @@ impl Identity {
     pub fn generate(name: impl Into<String>) -> Identity {
         let signing_key = SigningKey::<MlDsa65>::generate();
         let public_key = signing_key.verifying_key().encode().to_vec();
-        let (kem_dk, kem_ek) = kem::generate();
+        // Derive the KEM keypair from the signing seed so it is stable across
+        // loads/processes (REQ: ML-KEM payload encryption).
+        let (kem_dk, kem_ek) = kem::derive_from_seed(signing_key.to_seed().as_slice());
         Identity {
             name: name.into(),
             signing_key,
@@ -108,7 +110,6 @@ impl Identity {
         let file = IdentityFile {
             name: self.name.clone(),
             seed: b64(seed.as_slice()),
-            kem_seed: Some(b64(&self.kem_dk)),
         };
         let text = serde_json::to_string_pretty(&file)?;
         std::fs::write(&path, text)?;
@@ -132,16 +133,11 @@ impl Identity {
             .map_err(|_| Error::Crypto("seed must be 32 bytes".into()))?;
         let signing_key = SigningKey::<MlDsa65>::from_seed(&seed.into());
         let public_key = signing_key.verifying_key().encode().to_vec();
-        // Restore the KEM keypair, or backfill a fresh one for pre-v2 files
-        // (persisted on the next `save()`).
-        let (kem_dk, kem_ek) = match file.kem_seed.as_deref() {
-            Some(stored) => {
-                let kem_dk = unb64(stored).map_err(|_| Error::Crypto("bad kem seed".into()))?;
-                let kem_ek = kem::ek_from_seed(&kem_dk);
-                (kem_dk, kem_ek)
-            }
-            None => kem::generate(),
-        };
+        // Derive the KEM keypair deterministically from the signing seed. This
+        // is what makes the advertised KEM key stable across every load and
+        // process, and gives migrated v0.1 identities (seed only, no stored KEM
+        // material) a working, stable KEM key (REQ: ML-KEM payload encryption).
+        let (kem_dk, kem_ek) = kem::derive_from_seed(&seed);
         Ok(Identity {
             name: file.name,
             signing_key,
@@ -259,6 +255,42 @@ mod tests {
         // The guard compares the requested name against this one: a mismatch
         // (e.g. requesting "worker") is what triggers the refuse-without-force.
         assert_ne!(name, "worker");
+
+        std::env::remove_var("AGENTMSG_HOME");
+    }
+
+    #[test]
+    fn migrated_v1_identity_has_stable_kem_key_that_round_trips() {
+        // Regression for issue #13: a v0.1 identity file carries only {name, seed}
+        // (no KEM material). Loading it must derive a STABLE KEM key — identical
+        // across separate loads (i.e. across the `id token` process and the daemon
+        // process) — and a message encrypted to the token's advertised KEM key
+        // must decrypt with the loaded identity's private key.
+        let _g = HOME_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTMSG_HOME", dir.path());
+
+        // Hand-write a legacy v0.1 identity.json: name + seed ONLY.
+        let seed = [42u8; SEED_LEN];
+        let legacy = format!(
+            "{{\n  \"name\": \"worker\",\n  \"seed\": \"{}\"\n}}",
+            b64(&seed)
+        );
+        std::fs::write(paths::identity_path().unwrap(), legacy).unwrap();
+
+        // Two independent loads (simulating two processes) must agree on the KEM
+        // public key — the bug was that each load generated a fresh ephemeral one.
+        let load1 = Identity::load().unwrap();
+        let load2 = Identity::load().unwrap();
+        assert_eq!(load1.kem_ek(), load2.kem_ek(), "KEM key must be stable");
+        assert_eq!(load1.token().kem_public_key.as_deref(), Some(load1.kem_ek()));
+
+        // Cross-load encryption round-trip: encapsulate to load1's *advertised
+        // token* key, decapsulate with load2's private key.
+        let advertised = load1.token().kem_public_key.unwrap();
+        let (ct, ss_send) = crate::kem::encapsulate(&advertised).expect("encapsulate");
+        let ss_recv = crate::kem::decapsulate(load2.kem_dk(), &ct).expect("decapsulate");
+        assert_eq!(ss_send, ss_recv, "shared secret must match across loads");
 
         std::env::remove_var("AGENTMSG_HOME");
     }
