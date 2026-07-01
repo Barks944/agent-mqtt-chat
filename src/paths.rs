@@ -16,11 +16,47 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(pd.data_dir().to_path_buf())
 }
 
-/// Ensure the data directory exists and return it.
+/// Ensure the data directory exists and return it, restricting it to the owner
+/// on Unix so the secrets and message history it holds are not group/world
+/// readable on a multi-user host.
 pub fn ensure_data_dir() -> Result<PathBuf> {
     let dir = data_dir()?;
     std::fs::create_dir_all(&dir)?;
+    harden_dir(&dir)?;
     Ok(dir)
+}
+
+/// Restrict a file to owner read/write (0600) on Unix. No-op on Windows, where
+/// the data dir lives under the ACL-protected user profile.
+pub fn harden_file(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Restrict a directory to owner access (0700) on Unix. No-op on Windows.
+pub fn harden_dir(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 pub fn config_path() -> Result<PathBuf> {

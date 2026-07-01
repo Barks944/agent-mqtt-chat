@@ -66,6 +66,12 @@ impl Mqtt {
         let stop_flag = stop.clone();
 
         let handle = thread::spawn(move || {
+            // Whatever exits this thread (a clean stop, a panic escaping the loop,
+            // or the iterator ending) MUST leave `connected` false, so callers of
+            // `is_connected()` never observe a stale `true` after the eventloop is
+            // gone (fixes a silent-death hang where the daemon believed it was
+            // connected forever). A Drop guard guarantees it on every exit path.
+            let _conn_guard = ConnGuard(conn_flag.clone());
             let mut backoff = Duration::from_millis(250);
             for event in connection.iter() {
                 if stop_flag.load(Ordering::Relaxed) {
@@ -81,7 +87,22 @@ impl Mqtt {
                         }
                     }
                     Ok(Event::Incoming(Packet::Publish(p))) => {
-                        on_message(p.topic.clone(), p.payload.to_vec());
+                        // Isolate the user callback: a panic inside `on_message`
+                        // (e.g. a poisoned mutex on the ingest path) must NOT kill
+                        // the eventloop thread. Catch it, drop the one message, and
+                        // keep the connection alive.
+                        let topic = p.topic.clone();
+                        let payload = p.payload.to_vec();
+                        let cb = &on_message;
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            cb(topic, payload);
+                        }))
+                        .is_err()
+                        {
+                            tracing::error!(
+                                "on_message panicked; dropping message, eventloop continues"
+                            );
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -91,13 +112,16 @@ impl Mqtt {
                             break;
                         }
                         // Bounded exponential backoff (REQ-0034); the iterator
-                        // reconnects on the next poll.
-                        thread::sleep(backoff);
+                        // reconnects on the next poll. Sleep in short slices so a
+                        // concurrent `stop()` is honoured promptly instead of
+                        // blocking a `disconnect()`/shutdown for up to 30s.
+                        if sleep_interruptible(backoff, &stop_flag) {
+                            break;
+                        }
                         backoff = (backoff * 2).min(Duration::from_secs(30));
                     }
                 }
             }
-            conn_flag.store(false, Ordering::Relaxed);
         });
 
         Ok(Mqtt {
@@ -110,9 +134,15 @@ impl Mqtt {
 
     /// Publish a payload at QoS1 (REQ-0016 delivery semantics).
     pub fn publish(&self, topic: &str, payload: Vec<u8>, retain: bool) -> Result<()> {
-        self.client
-            .publish(topic, QoS::AtLeastOnce, retain, payload)
-            .map_err(|e| Error::Mqtt(e.to_string()))
+        publish_on(&self.client, topic, payload, retain)
+    }
+
+    /// A cheap clone of the broker client handle. Callers use this to publish
+    /// WITHOUT holding the daemon's `Mutex<Option<Mqtt>>` across the (potentially
+    /// blocking) publish — `rumqttc::Client` is a thin handle over the request
+    /// channel, so cloning is cheap and the clone stays valid for the session.
+    pub fn client(&self) -> Client {
+        self.client.clone()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -135,5 +165,62 @@ impl Drop for Mqtt {
         if self.handle.is_some() {
             self.stop();
         }
+    }
+}
+
+/// Publish `payload` at QoS1 on a bare client handle (see [`Mqtt::client`]).
+/// Kept as a free function so the daemon can publish from a cloned handle
+/// without holding any lock across the call.
+pub fn publish_on(client: &Client, topic: &str, payload: Vec<u8>, retain: bool) -> Result<()> {
+    client
+        .publish(topic, QoS::AtLeastOnce, retain, payload)
+        .map_err(|e| Error::Mqtt(e.to_string()))
+}
+
+/// Clears the `connected` flag when the eventloop thread exits by any path,
+/// including a panic that unwinds out of the loop.
+struct ConnGuard(Arc<AtomicBool>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Sleep for `dur`, waking early if `stop` is set. Returns `true` if a stop was
+/// observed (so the caller should break out of the eventloop).
+fn sleep_interruptible(dur: Duration, stop: &AtomicBool) -> bool {
+    let step = Duration::from_millis(100);
+    let mut slept = Duration::ZERO;
+    while slept < dur {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let this = step.min(dur - slept);
+        thread::sleep(this);
+        slept += this;
+    }
+    stop.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn sleep_interruptible_returns_early_when_stop_already_set() {
+        // The disconnect-responsiveness fix: a long backoff must not be served
+        // in full once stop is signalled.
+        let stop = AtomicBool::new(true);
+        let start = Instant::now();
+        assert!(sleep_interruptible(Duration::from_secs(30), &stop));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn sleep_interruptible_sleeps_full_duration_when_not_stopped() {
+        let stop = AtomicBool::new(false);
+        assert!(!sleep_interruptible(Duration::from_millis(150), &stop));
     }
 }

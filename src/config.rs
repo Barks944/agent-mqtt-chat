@@ -122,12 +122,15 @@ impl Config {
         toml::from_str(&text).map_err(|e| Error::Config(e.to_string()))
     }
 
-    /// Persist config to disk.
+    /// Persist config to disk. The file holds the broker username/password in
+    /// plaintext, so it is restricted to the owner (0600 on Unix) like the
+    /// identity and authority key files.
     pub fn save(&self) -> Result<()> {
         paths::ensure_data_dir()?;
         let path = paths::config_path()?;
         let text = toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))?;
         std::fs::write(&path, text)?;
+        paths::harden_file(&path)?;
         Ok(())
     }
 

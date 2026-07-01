@@ -24,7 +24,7 @@ use crate::ipc::{self, PendingPairView, Request, Response, StreamFrame, IPC_PROT
 use crate::store::{ConsumerRow, PresenceRow, RejectionRow};
 use crate::token::IdentityToken;
 use crate::trust::TrustStore;
-use crate::wire::{fingerprint, BROADCAST, CTYPE_TEXT};
+use crate::wire::{fingerprint, validate_name, BROADCAST, CTYPE_TEXT};
 
 #[derive(Parser)]
 #[command(
@@ -85,7 +85,7 @@ pub enum Command {
         /// Message body (omit when using --file).
         body: Option<String>,
         /// Recipient agent name (omit with --broadcast).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "broadcast")]
         to: Option<String>,
         /// Address to all agents on the topic.
         #[arg(long)]
@@ -131,6 +131,9 @@ pub enum Command {
         /// Block until at least one message is available.
         #[arg(long)]
         wait: bool,
+        /// Cap how long `--wait` blocks, in seconds (0 or unset = wait forever).
+        #[arg(long)]
+        wait_timeout: Option<u64>,
         /// Acknowledge the returned batch (advance the cursor).
         #[arg(long)]
         ack: bool,
@@ -414,6 +417,7 @@ fn exit_code(e: &Error) -> i32 {
         | Error::TokenCorrupt(_)
         | Error::RotationRequired(_)
         | Error::NotAnAuthorityToken => 5,
+        Error::Timeout(_) => 6,
         _ => 1,
     }
 }
@@ -492,9 +496,10 @@ fn dispatch(cli: &Cli) -> Result<()> {
             consumer,
             limit,
             wait,
+            wait_timeout,
             ack,
             follow,
-        } => read_cmd(json, consumer, *limit, *wait, *ack, *follow),
+        } => read_cmd(json, consumer, *limit, *wait, *wait_timeout, *ack, *follow),
         Command::Browse {
             limit,
             from,
@@ -560,6 +565,8 @@ fn read_token_input(token: &Option<String>, file: &Option<PathBuf>) -> Result<St
 fn id_cmd(json: bool, cmd: &IdCmd) -> Result<()> {
     match cmd {
         IdCmd::Generate { name, force } => {
+            validate_name(name)
+                .map_err(|e| Error::Config(format!("invalid identity name: {e}")))?;
             // Cross-name guard + backup before overwrite (REQ: id-generate guard).
             if let Some((existing_name, existing_fp)) = identity::load_name_fp()? {
                 if !force {
@@ -728,6 +735,8 @@ fn agent_cmd(json: bool, cmd: &AgentCmd) -> Result<()> {
 fn authority_cmd(json: bool, cmd: &AuthorityCmd) -> Result<()> {
     match cmd {
         AuthorityCmd::Generate { name, force } => {
+            validate_name(name)
+                .map_err(|e| Error::Config(format!("invalid authority name: {e}")))?;
             if Authority::exists() && !force {
                 return Err(Error::IdentityExists(
                     "an authority key already exists; use --force to overwrite".into(),
@@ -1441,10 +1450,15 @@ fn read_cmd(
     consumer: &Option<String>,
     limit: i64,
     wait: bool,
+    wait_timeout: Option<u64>,
     ack: bool,
     follow: bool,
 ) -> Result<()> {
     let consumer = default_consumer(consumer)?;
+    // A bounded `--wait` deadline: `None`/0 means wait indefinitely.
+    let deadline = wait_timeout
+        .filter(|s| *s > 0)
+        .map(|s| Instant::now() + Duration::from_secs(s));
     // Drain the queue first.
     let (msgs, warning) = loop {
         let resp = call(Request::Read {
@@ -1457,6 +1471,12 @@ fn read_cmd(
                 consumer_warning,
             } => {
                 if m.is_empty() && wait && !follow {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Err(Error::Timeout(format!(
+                            "no message within {}s",
+                            wait_timeout.unwrap_or(0)
+                        )));
+                    }
                     std::thread::sleep(Duration::from_millis(250));
                     continue;
                 }
@@ -1493,7 +1513,12 @@ fn follow_stream(json: bool, consumer: &str, ack: bool) -> Result<()> {
     loop {
         let bytes = match ipc::read_frame(&mut conn) {
             Ok(b) => b,
-            Err(_) => return Ok(()), // daemon closed the stream
+            // A clean close at a frame boundary (EOF) is a normal stream end.
+            // Any other I/O error (connection reset, broken pipe, a truncated
+            // frame from a daemon that crashed mid-write) is a real failure and
+            // must surface as a non-zero exit, not a silent success.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(Error::Ipc(format!("follow stream ended unexpectedly: {e}"))),
         };
         let frame: StreamFrame = serde_json::from_slice(&bytes)?;
         match frame {

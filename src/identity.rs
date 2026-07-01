@@ -283,7 +283,10 @@ mod tests {
         let load1 = Identity::load().unwrap();
         let load2 = Identity::load().unwrap();
         assert_eq!(load1.kem_ek(), load2.kem_ek(), "KEM key must be stable");
-        assert_eq!(load1.token().kem_public_key.as_deref(), Some(load1.kem_ek()));
+        assert_eq!(
+            load1.token().kem_public_key.as_deref(),
+            Some(load1.kem_ek())
+        );
 
         // Cross-load encryption round-trip: encapsulate to load1's *advertised
         // token* key, decapsulate with load2's private key.

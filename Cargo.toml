@@ -1,6 +1,6 @@
 [package]
 name = "agentmsg"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.88"
 description = "Cross-host agent-to-agent messaging: a Rust daemon + CLI over MQTT with post-quantum signatures and a trust store"
