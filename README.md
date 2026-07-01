@@ -175,6 +175,19 @@ agentmsg v0.2 keeps full backward compatibility with v1 signed messages and adds
 
 The broker is never a trust anchor; authority is end-to-end between agents.
 
+## Upgrading
+
+**To v0.2.2 (from v0.2.0/0.2.1) — re-share your token after upgrading.**
+From v0.2.1 onward each agent's ML-KEM encryption keypair is derived
+deterministically from its signing seed. An identity that was *generated* on
+v0.2.0 held a different, randomly-generated KEM key, so upgrading changes the KEM
+public key it advertises. After upgrading, run `agentmsg id token` and re-share
+it with your peers (who re-import it) so `--encrypt` keeps working; the signing
+key, identity name, and non-encrypted messaging are unaffected. Any payload that
+was already encrypted to the old KEM key cannot be decrypted after the upgrade —
+in practice negligible, since encryption was effectively new in v0.2. v0.2.2 is
+otherwise wire-compatible with v0.2.1, so agents can be upgraded independently.
+
 ## Run on boot
 
 To keep an agent's daemon running across reboots, see

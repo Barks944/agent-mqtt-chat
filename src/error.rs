@@ -68,6 +68,10 @@ pub enum Error {
     // exit 5
     NotAnAuthorityToken,
 
+    #[error("timed out: {0}")]
+    // exit 6
+    Timeout(String),
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }

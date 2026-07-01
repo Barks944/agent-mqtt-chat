@@ -136,12 +136,22 @@ impl Store {
 
     /// Open a store at a specific path (used in tests).
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Store> {
+        let path = path.as_ref();
         let conn = Connection::open(path).map_err(map_err)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_err)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(map_err)?;
         Self::migrate(&conn)?;
+        // Message bodies/senders/recipients are stored in the clear when
+        // encryption is off (the default), so restrict the db and its WAL/SHM
+        // sidecars to the owner on Unix.
+        let _ = paths::harden_file(path);
+        for ext in ["-wal", "-shm"] {
+            let mut side = path.as_os_str().to_owned();
+            side.push(ext);
+            let _ = paths::harden_file(std::path::Path::new(&side));
+        }
         Ok(Store {
             conn: Mutex::new(conn),
         })

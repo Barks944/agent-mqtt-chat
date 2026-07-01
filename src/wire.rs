@@ -186,6 +186,26 @@ pub fn split_kid(kid: &str) -> Option<(&str, &str)> {
     kid.split_once('#')
 }
 
+/// Validate an agent/authority name for use in a `kid`.
+///
+/// The `kid` is `name#fingerprint` and is split on the first `#`, so a name
+/// containing `#` would corrupt the split (truncating the name and breaking
+/// signer lookup / audit attribution). Names must also be non-empty and free of
+/// whitespace and control characters. Returns `Err` with a human-readable
+/// reason on rejection.
+pub fn validate_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("name must not be empty".into());
+    }
+    if name.contains('#') {
+        return Err("name must not contain '#' (reserved as the kid separator)".into());
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("name must not contain whitespace or control characters".into());
+    }
+    Ok(())
+}
+
 /// Encode bytes as base64url without padding.
 pub fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
@@ -235,6 +255,23 @@ impl Wrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_name_accepts_plain_names() {
+        assert!(validate_name("alice").is_ok());
+        assert!(validate_name("agent-1").is_ok());
+        assert!(validate_name("planner.v2").is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_kid_breakers() {
+        // '#' is the kid separator — a name containing it would corrupt
+        // split_kid and misattribute signer lookups.
+        assert!(validate_name("mal#lory").is_err());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("has space").is_err());
+        assert!(validate_name("tab\tname").is_err());
+    }
 
     /// Minimal cleartext, signed `Inner` for wire tests (v2 field set).
     fn test_inner(id: &str, from: &str, to: &str, body: &str) -> Inner {

@@ -233,11 +233,24 @@ pub fn write_frame<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
     w.flush()
 }
 
-/// Read a length-prefixed frame.
+/// Maximum accepted IPC frame size (16 MiB). Bounds the allocation driven by
+/// the length prefix so a buggy or hostile local client cannot make the daemon
+/// allocate an arbitrary amount before the request is even parsed. Comfortably
+/// larger than any real request (which is capped by the MQTT payload limit).
+pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// Read a length-prefixed frame, rejecting an implausibly large length prefix
+/// before allocating.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let n = u32::from_le_bytes(len) as usize;
+    if n > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length {n} exceeds maximum {MAX_FRAME_LEN}"),
+        ));
+    }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)?;
     Ok(buf)
@@ -280,4 +293,28 @@ pub fn subscribe(agent: &str, consumer: &str, ack: bool) -> Result<BufReader<Str
 /// Is the named agent's daemon currently listening?
 pub fn daemon_running(agent: &str) -> bool {
     matches!(call(agent, &Request::Ping), Ok(Response::Pong))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn frame_roundtrip() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, b"hello").unwrap();
+        let mut cur = Cursor::new(buf);
+        assert_eq!(read_frame(&mut cur).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn read_frame_rejects_oversized_length_prefix() {
+        // A hostile/buggy length prefix larger than MAX_FRAME_LEN must be
+        // rejected before any allocation, not honoured.
+        let huge = (MAX_FRAME_LEN as u32 + 1).to_le_bytes();
+        let mut cur = Cursor::new(huge.to_vec());
+        let err = read_frame(&mut cur).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 }

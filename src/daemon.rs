@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{ListenerOptions, Stream};
+use rumqttc::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -27,7 +28,7 @@ use crate::ipc::{
     self, PendingPairView, Request, Response, StatusInfo, StreamFrame, IPC_PROTO_VERSION,
 };
 use crate::message::{self, BuildOpts};
-use crate::mqtt::{Mqtt, OnMessage};
+use crate::mqtt::{self, Mqtt, OnMessage};
 use crate::pair::sas;
 use crate::store::{Outbound, Store, StoredMsg};
 use crate::trust::TrustStore;
@@ -36,8 +37,25 @@ use crate::wire::{
     CTYPE_RECEIPT,
 };
 
-/// Registry of live streaming subscribers: (unique id, consumer name, sender).
-type Subscribers = Arc<Mutex<Vec<(u64, String, SyncSender<StreamFrame>)>>>;
+/// A live streaming subscriber fed by the ingest path (REQ: IPC stream).
+struct Subscriber {
+    /// Unique registry id (used for deregistration).
+    id: u64,
+    /// Consumer name this stream serves. Not yet used for routing (all inbound
+    /// is fanned out to every subscriber today); reserved for the per-name
+    /// mailbox routing the local-hub mode will need.
+    #[allow(dead_code)]
+    consumer: String,
+    /// Channel to the serving thread.
+    tx: SyncSender<StreamFrame>,
+    /// Messages dropped since the last successfully-delivered lag notice. Kept
+    /// per subscriber so the reported count is accurate across a burst and the
+    /// `Lagged` signal is never silently lost.
+    dropped: u64,
+}
+
+/// Registry of live streaming subscribers.
+type Subscribers = Arc<Mutex<Vec<Subscriber>>>;
 
 /// A peer seen on the pairing topic, awaiting an out-of-band SAS confirmation
 /// before it is added to the trust store (REQ: bootstrap/pairing mode).
@@ -299,9 +317,15 @@ impl Daemon {
     }
 
     /// Disconnect the broker session (REQ-0018).
+    ///
+    /// The `Mqtt` is taken out of the mutex *before* `stop()` is called, so the
+    /// blocking join on the eventloop thread happens with the lock released.
+    /// Otherwise a `disconnect` while the broker is unreachable would hold the
+    /// daemon-wide mqtt lock for the whole reconnect backoff, freezing every
+    /// other IPC request that touches it.
     fn disconnect(&self) {
-        let mut guard = self.mqtt.lock().unwrap();
-        if let Some(mut m) = guard.take() {
+        let taken = self.mqtt.lock().unwrap().take();
+        if let Some(mut m) = taken {
             m.stop();
         }
     }
@@ -315,30 +339,32 @@ impl Daemon {
             .unwrap_or(false)
     }
 
+    /// Clone the broker client handle iff currently connected, holding the mqtt
+    /// mutex only for the clone. Publishing through the returned handle never
+    /// blocks under the lock (fixes daemon-wide stalls when the broker applies
+    /// backpressure and `rumqttc`'s bounded request channel fills up).
+    fn connected_client(&self) -> Option<Client> {
+        let guard = self.mqtt.lock().unwrap();
+        match guard.as_ref() {
+            Some(m) if m.is_connected() => Some(m.client()),
+            _ => None,
+        }
+    }
+
     /// Periodically flush the durable outbox while connected (REQ-0016).
     fn spawn_outbox_pump(self: &Arc<Self>) {
+        let this = self.clone();
         let store = self.store.clone();
-        let mqtt = self.mqtt.clone();
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(1));
-            let connected = mqtt
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|m| m.is_connected())
-                .unwrap_or(false);
-            if !connected {
+            // Grab a client handle only if connected, then publish with the lock
+            // released so a slow/backpressured broker cannot stall other IPC.
+            let Some(client) = this.connected_client() else {
                 continue;
-            }
+            };
             let pending = store.pending_outbound().unwrap_or_default();
             for ob in pending {
-                let ok = mqtt
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|m| m.publish(&ob.topic, ob.payload.clone(), ob.retain).is_ok())
-                    .unwrap_or(false);
-                if ok {
+                if mqtt::publish_on(&client, &ob.topic, ob.payload.clone(), ob.retain).is_ok() {
                     let _ = store.mark_delivered(&ob.id);
                 }
             }
@@ -397,13 +423,25 @@ impl Daemon {
     }
 
     /// Register a streaming subscriber and forward frames until the peer
-    /// disconnects (detected on the next failed write).
-    fn serve_subscribe(self: Arc<Self>, mut br: BufReader<Stream>, consumer: String, _ack: bool) {
+    /// disconnects (detected on the next failed write). When `ack` is set, each
+    /// message frame that is successfully delivered advances the consumer cursor
+    /// (and emits a read receipt), so `read --follow --ack` does not redeliver
+    /// streamed messages on a later plain `read`.
+    fn serve_subscribe(self: Arc<Self>, mut br: BufReader<Stream>, consumer: String, ack: bool) {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = sync_channel::<StreamFrame>(256);
-        self.subscribers.lock().unwrap().push((id, consumer, tx));
+        self.subscribers.lock().unwrap().push(Subscriber {
+            id,
+            consumer: consumer.clone(),
+            tx,
+            dropped: 0,
+        });
         // Forward frames; a write error means the CLI hung up.
         while let Ok(frame) = rx.recv() {
+            let seq = match &frame {
+                StreamFrame::Message(m) => Some(m.seq),
+                StreamFrame::Lagged { .. } => None,
+            };
             let bytes = match serde_json::to_vec(&frame) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -411,12 +449,16 @@ impl Daemon {
             if ipc::write_frame(br.get_mut(), &bytes).is_err() {
                 break;
             }
+            // Only advance the cursor once the frame is actually delivered.
+            if ack {
+                if let Some(seq) = seq {
+                    let _ = self.store.ack(&consumer, seq);
+                    self.maybe_read_receipt(seq);
+                }
+            }
         }
         // Deregister this subscriber by its unique id.
-        self.subscribers
-            .lock()
-            .unwrap()
-            .retain(|(sid, _, _)| *sid != id);
+        self.subscribers.lock().unwrap().retain(|s| s.id != id);
     }
 
     fn handle(&self, req: Request) -> Response {
@@ -693,13 +735,8 @@ impl Daemon {
             return err(e);
         }
         // Publish immediately when connected (the outbox pump covers the rest).
-        if self.is_connected() {
-            let _ = self
-                .mqtt
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|m| m.publish(&topic, payload, false));
+        if let Some(client) = self.connected_client() {
+            let _ = mqtt::publish_on(&client, &topic, payload, false);
         }
         Response::Ok
     }
@@ -859,15 +896,8 @@ impl Daemon {
         }
 
         let mut delivery_state = "pending".to_string();
-        if self.is_connected() {
-            let published = self
-                .mqtt
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|m| m.publish(&topic, payload, false).is_ok())
-                .unwrap_or(false);
-            if published {
+        if let Some(client) = self.connected_client() {
+            if mqtt::publish_on(&client, &topic, payload, false).is_ok() {
                 let _ = self.store.mark_delivered(&inner.id);
                 delivery_state = "sent".to_string();
             }
@@ -967,19 +997,31 @@ fn init_file_tracing() {
 }
 
 /// Push a newly stored inbound message to every live subscriber, dropping any
-/// that have disconnected and signalling lag when a channel is full.
+/// that have disconnected. If a subscriber's channel is full the message is
+/// counted against that subscriber's running `dropped` total; the accurate lag
+/// count is delivered as a single `Lagged` frame as soon as the channel drains,
+/// so the signal is never silently lost or understated.
 fn push_to_subscribers(subs: &Subscribers, msg: &StoredMsg) {
     let mut guard = subs.lock().unwrap();
-    guard.retain(
-        |(_, _, tx)| match tx.try_send(StreamFrame::Message(msg.clone())) {
+    guard.retain_mut(|s| {
+        // First flush any outstanding lag notice so the consumer learns exactly
+        // how many messages it missed before receiving the next live one.
+        if s.dropped > 0 {
+            match s.tx.try_send(StreamFrame::Lagged { dropped: s.dropped }) {
+                Ok(()) => s.dropped = 0,
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        match s.tx.try_send(StreamFrame::Message(msg.clone())) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
-                let _ = tx.try_send(StreamFrame::Lagged { dropped: 1 });
+                s.dropped += 1;
                 true
             }
             Err(TrySendError::Disconnected(_)) => false,
-        },
-    );
+        }
+    });
 }
 
 /// Build + durably enqueue an automatic delivery/read receipt to `to`.
